@@ -1,0 +1,243 @@
+name: ⚡ Infinite IP Scanner — 20 Shards, 6‑Hour Marathon
+
+on:
+  workflow_dispatch:
+    inputs:
+      port:
+        description: 'TCP port (default 80)'
+        required: true
+        default: '80'
+      timeout:
+        description: 'TCP connection timeout in seconds (default 10)'
+        required: true
+        default: '10'
+      skip_ping:
+        description: 'Skip ICMP ping (true/false)'
+        required: true
+        default: 'false'
+
+jobs:
+  scan-shard:
+    strategy:
+      matrix:
+        shard: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # ≈ 5.83 hours
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Set up Git for push
+        run: |
+          git remote set-url origin https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Install dependencies
+        run: pip install --quiet ipaddress requests
+
+      - name: Run scanner for 6 hours (shard ${{ matrix.shard }})
+        env:
+          SCAN_PORT: ${{ github.event.inputs.port }}
+          SCAN_TIMEOUT: ${{ github.event.inputs.timeout }}
+          SHARD_INDEX: ${{ matrix.shard }}
+          SKIP_PING: ${{ github.event.inputs.skip_ping }}
+        run: |
+          cat << 'PYEOF' > scanner.py
+          import random, socket, subprocess, threading, time, os, requests
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from queue import Queue, Empty
+          import ipaddress
+
+          PORT = int(os.environ["SCAN_PORT"])
+          TCP_TIMEOUT = float(os.environ["SCAN_TIMEOUT"])
+          SHARD = os.environ["SHARD_INDEX"]
+          SKIP_PING = os.environ.get("SKIP_PING","false").lower() == "true"
+          MAX_WORKERS = 500
+          PING_SEM = threading.Semaphore(300)
+          SCAN_DURATION = 21300  # 5.92 hours (safer than exact 6h)
+
+          LIVE_IPS = []
+          lock = threading.Lock()
+          ip_pool = Queue(maxsize=100000)
+
+          SEEDS = []
+          if os.path.isfile("seed_ips.txt"):
+              with open("seed_ips.txt") as f:
+                  SEEDS = [line.strip() for line in f if line.strip()]
+
+          PROXY_SOURCES = [
+              "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
+              "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=https&timeout=10000&country=all&ssl=all&anonymity=all",
+              "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+              "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/https.txt",
+              "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+              "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
+              "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+              "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/http.txt",
+              "https://www.proxy-list.download/api/v1/get?type=http",
+              "https://www.proxy-list.download/api/v1/get?type=https",
+          ]
+
+          def fetch_proxies():
+              for url in PROXY_SOURCES:
+                  try:
+                      resp = requests.get(url, timeout=8)
+                      lines = resp.text.strip().split('\n')
+                      added = 0
+                      for line in lines:
+                          line = line.strip()
+                          if not line or line.startswith('#'): continue
+                          ip = line.split(':')[0] if ':' in line else line
+                          try:
+                              ipaddress.IPv4Address(ip)
+                              ip_pool.put(ip, block=False)
+                              added += 1
+                          except: pass
+                      print(f"[SHARD {SHARD}] Fetched {added} from {url}")
+                  except: pass
+
+          def random_public_ip():
+              while True:
+                  ip_int = random.randint(0x01000000, 0xfffffffe)
+                  ip = str(ipaddress.IPv4Address(ip_int))
+                  if not ipaddress.IPv4Address(ip).is_private:
+                      return ip
+
+          def neighbors(seed):
+              try:
+                  base = ipaddress.IPv4Address(seed)
+                  net = ipaddress.IPv4Network(f"{base}/24", strict=False)
+                  for ip in net.hosts():
+                      yield str(ip)
+              except: pass
+
+          def icmp_ping(ip, timeout=1):
+              try:
+                  with PING_SEM:
+                      r = subprocess.run(
+                          ["ping","-c","1","-W",str(timeout), ip],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          timeout=timeout+0.5
+                      )
+                  return r.returncode == 0
+              except: return False
+
+          def tcp_test(ip):
+              try:
+                  with socket.create_connection((ip, PORT), TCP_TIMEOUT):
+                      return True
+              except: return False
+
+          def test_ip(ip):
+              if not SKIP_PING and not icmp_ping(ip, timeout=1):
+                  return
+              if tcp_test(ip):
+                  with lock:
+                      LIVE_IPS.append(ip)
+
+          def feeder():
+              # Phase 1: scrape
+              print(f"[SHARD {SHARD}] Phase 1: Scraping proxies...")
+              fetch_proxies()
+              print(f"[SHARD {SHARD}] Phase 2: Generating random IPs & seed neighbors...")
+              while time.time() - start_time < SCAN_DURATION - 300:
+                  # 100 random IPs each loop
+                  for _ in range(100):
+                      try: ip_pool.put(random_public_ip(), block=False)
+                      except: pass
+                  # seed neighbors
+                  for seed in SEEDS:
+                      for nip in neighbors(seed):
+                          try: ip_pool.put(nip, block=False)
+                          except: break
+                  time.sleep(0.005)
+              print(f"[SHARD {SHARD}] Feeder finished.", flush=True)
+
+          def git_push():
+              while time.time() - start_time < SCAN_DURATION - 300:
+                  time.sleep(10)
+                  with lock: ips = list(LIVE_IPS)
+                  fname = f"shard_{SHARD}_ips.txt"
+                  fname_port = f"shard_{SHARD}_ips_with_port.txt"
+                  with open(fname, "w") as f: f.write("\n".join(ips))
+                  with open(fname_port, "w") as f: f.write("\n".join([f"{ip}:{PORT}" for ip in ips]))
+                  subprocess.run(["git","add",fname,fname_port])
+                  rc = subprocess.run(["git","diff","--cached","--quiet"]).returncode
+                  if rc != 0:
+                      subprocess.run(["git","commit","-m",f"Shard {SHARD} – {len(ips)} IPs"])
+                      subprocess.run(["git","push"])
+
+          print(f"Shard {SHARD} running for ~6 hours (skip_ping={SKIP_PING})")
+          start_time = time.time()
+          threading.Thread(target=feeder, daemon=True).start()
+          threading.Thread(target=git_push, daemon=True).start()
+
+          with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+              futures = []
+              while time.time() - start_time < SCAN_DURATION:
+                  while len(futures) < MAX_WORKERS:
+                      try: futures.append(executor.submit(test_ip, ip_pool.get(timeout=0.1)))
+                      except Empty: pass
+                  futures = [f for f in futures if not f.done()]
+              for f in as_completed(futures): pass
+
+          # final commit
+          with lock: ips = list(LIVE_IPS)
+          fname = f"shard_{SHARD}_ips.txt"
+          fname_port = f"shard_{SHARD}_ips_with_port.txt"
+          with open(fname, "w") as f: f.write("\n".join(ips))
+          with open(fname_port, "w") as f: f.write("\n".join([f"{ip}:{PORT}" for ip in ips]))
+          subprocess.run(["git","add",fname,fname_port])
+          subprocess.run(["git","commit","-m",f"Shard {SHARD} final – {len(ips)} IPs"]) 
+          subprocess.run(["git","push"])
+          print(f"Shard {SHARD} finished. {len(ips)} IPs collected.")
+          PYEOF
+          python3 scanner.py
+
+  merge:
+    needs: scan-shard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Pull latest commits
+        run: git pull origin ${{ github.ref }}
+
+      - name: Merge all shards, deduplicate & split to 500KB
+        run: |
+          mkdir -p merged
+          > merged/all_ips.txt
+          > merged/all_ips_port.txt
+
+          for i in {1..20}; do
+            f="shard_${i}_ips.txt"
+            fp="shard_${i}_ips_with_port.txt"
+            if [ -f "$f" ]; then
+              cat "$f" >> merged/all_ips.txt
+              cat "$fp" >> merged/all_ips_port.txt
+            fi
+          done
+
+          sort -u merged/all_ips.txt -o merged/all_ips.txt
+          sort -u merged/all_ips_port.txt -o merged/all_ips_port.txt
+
+          # split to 500KB files
+          if [ -s merged/all_ips.txt ]; then
+            split -C 500K --numeric-suffixes=1 --additional-suffix=.txt merged/all_ips.txt white_ips_
+          fi
+          if [ -s merged/all_ips_port.txt ]; then
+            split -C 500K --numeric-suffixes=1 --additional-suffix=.txt merged/all_ips_port.txt white_ips_with_port_
+          fi
+
+          rm -f merged/all_ips.txt merged/all_ips_port.txt
+
+          git add white_ips_*.txt white_ips_with_port_*.txt || true
+          git commit -m "✅ Final merged IPs (6‑hour run)" || echo "No changes"
+          git push
