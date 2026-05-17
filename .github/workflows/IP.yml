@@ -1,4 +1,4 @@
-name: ⚡ Live Partitioned IP Scanner — 500KB Chunks Every 20s
+name: ⚡ Infinite IP Scanner — 20 Shards, 6‑Hour Marathon
 
 on:
   workflow_dispatch:
@@ -20,9 +20,9 @@ jobs:
   scan-shard:
     strategy:
       matrix:
-        shard: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17]
+        shard: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 350   # ≈ 5.83 hours
 
     steps:
       - name: Checkout repository
@@ -58,7 +58,7 @@ jobs:
           SKIP_PING = os.environ.get("SKIP_PING","false").lower() == "true"
           MAX_WORKERS = 500
           PING_SEM = threading.Semaphore(300)
-          SCAN_DURATION = 21300  # 5.92 hours
+          SCAN_DURATION = 21300  # 5.92 hours (safer than exact 6h)
 
           LIVE_IPS = []
           lock = threading.Lock()
@@ -140,13 +140,16 @@ jobs:
                       LIVE_IPS.append(ip)
 
           def feeder():
+              # Phase 1: scrape
               print(f"[SHARD {SHARD}] Phase 1: Scraping proxies...")
               fetch_proxies()
               print(f"[SHARD {SHARD}] Phase 2: Generating random IPs & seed neighbors...")
               while time.time() - start_time < SCAN_DURATION - 300:
+                  # 100 random IPs each loop
                   for _ in range(100):
                       try: ip_pool.put(random_public_ip(), block=False)
                       except: pass
+                  # seed neighbors
                   for seed in SEEDS:
                       for nip in neighbors(seed):
                           try: ip_pool.put(nip, block=False)
@@ -182,7 +185,7 @@ jobs:
                   futures = [f for f in futures if not f.done()]
               for f in as_completed(futures): pass
 
-          # Final commit
+          # final commit
           with lock: ips = list(LIVE_IPS)
           fname = f"shard_{SHARD}_ips.txt"
           fname_port = f"shard_{SHARD}_ips_with_port.txt"
@@ -195,108 +198,46 @@ jobs:
           PYEOF
           python3 scanner.py
 
-  live-merge:
+  merge:
+    needs: scan-shard
     runs-on: ubuntu-latest
-    timeout-minutes: 350
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GH_PAT }}
 
-      - name: Set up Git for push
+      - name: Pull latest commits
+        run: git pull origin ${{ github.ref }}
+
+      - name: Merge all shards, deduplicate & split to 500KB
         run: |
-          git remote set-url origin https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p merged
+          > merged/all_ips.txt
+          > merged/all_ips_port.txt
 
-      - name: Live merge shard files and split into 500KB chunks every 20s
-        env:
-          PORT: ${{ github.event.inputs.port }}
-        run: |
-          while true; do
-            echo "Pulling latest..."
-            git pull --rebase origin ${{ github.ref_name }} 2>/dev/null || true
-
-            # ادغام فایل‌های shard
-            > all_ips.txt
-            > all_ips_port.txt
-            for f in shard_*_ips.txt; do
-              [ -f "$f" ] && cat "$f" >> all_ips.txt
-            done
-            for f in shard_*_ips_with_port.txt; do
-              [ -f "$f" ] && cat "$f" >> all_ips_port.txt
-            done
-
-            # حذف تکراری‌ها
-            sort -u all_ips.txt -o all_ips.txt
-            sort -u all_ips_port.txt -o all_ips_port.txt
-
-            # حذف فایل‌های قبلی live_ips
-            rm -f live_ips_*.txt live_ips_with_port_*.txt
-
-            # تقسیم به قطعات ۵۰۰KB (فقط در صورت وجود محتوا)
-            if [ -s all_ips.txt ]; then
-              split -C 500K --numeric-suffixes=1 --additional-suffix=.txt all_ips.txt live_ips_
+          for i in {1..20}; do
+            f="shard_${i}_ips.txt"
+            fp="shard_${i}_ips_with_port.txt"
+            if [ -f "$f" ]; then
+              cat "$f" >> merged/all_ips.txt
+              cat "$fp" >> merged/all_ips_port.txt
             fi
-            if [ -s all_ips_port.txt ]; then
-              split -C 500K --numeric-suffixes=1 --additional-suffix=.txt all_ips_port.txt live_ips_with_port_
-            fi
-
-            # تمیزکاری فایل‌های موقت
-            rm -f all_ips.txt all_ips_port.txt
-
-            # کامیت و پوش فقط در صورتی که فایلی برای اضافه کردن وجود داشته باشد
-            if ls live_ips_*.txt live_ips_with_port_*.txt 1>/dev/null 2>&1; then
-              git add live_ips_*.txt live_ips_with_port_*.txt
-              if ! git diff --cached --quiet; then
-                git commit -m "🔄 Live merge + partition @ $(date +'%H:%M:%S')"
-                git push
-              fi
-            fi
-
-            sleep 20
           done
 
-  final-merge:
-    needs: [scan-shard, live-merge]
-    runs-on: ubuntu-latest
-    if: always()
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GH_PAT }}
+          sort -u merged/all_ips.txt -o merged/all_ips.txt
+          sort -u merged/all_ips_port.txt -o merged/all_ips_port.txt
 
-      - name: Pull latest
-        run: git pull origin ${{ github.ref_name }}
-
-      - name: Final deduplicate and split (white_ips_)
-        run: |
-          > all_ips.txt
-          > all_ips_port.txt
-          for f in shard_*_ips.txt; do
-            [ -f "$f" ] && cat "$f" >> all_ips.txt
-          done
-          for f in shard_*_ips_with_port.txt; do
-            [ -f "$f" ] && cat "$f" >> all_ips_port.txt
-          done
-
-          sort -u all_ips.txt -o all_ips.txt
-          sort -u all_ips_port.txt -o all_ips_port.txt
-
-          rm -f white_ips_*.txt white_ips_with_port_*.txt
-          if [ -s all_ips.txt ]; then
-            split -C 500K --numeric-suffixes=1 --additional-suffix=.txt all_ips.txt white_ips_
+          # split to 500KB files
+          if [ -s merged/all_ips.txt ]; then
+            split -C 500K --numeric-suffixes=1 --additional-suffix=.txt merged/all_ips.txt white_ips_
           fi
-          if [ -s all_ips_port.txt ]; then
-            split -C 500K --numeric-suffixes=1 --additional-suffix=.txt all_ips_port.txt white_ips_with_port_
+          if [ -s merged/all_ips_port.txt ]; then
+            split -C 500K --numeric-suffixes=1 --additional-suffix=.txt merged/all_ips_port.txt white_ips_with_port_
           fi
 
-          rm -f all_ips.txt all_ips_port.txt
+          rm -f merged/all_ips.txt merged/all_ips_port.txt
 
-          if ls white_ips_*.txt white_ips_with_port_*.txt 1>/dev/null 2>&1; then
-            git add white_ips_*.txt white_ips_with_port_*.txt
-            git commit -m "✅ Final partitioned IP lists" || echo "No changes"
-            git push
-          fi
+          git add white_ips_*.txt white_ips_with_port_*.txt || true
+          git commit -m "✅ Final merged IPs (6‑hour run)" || echo "No changes"
+          git push
